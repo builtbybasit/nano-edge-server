@@ -125,6 +125,21 @@ def wav_header_unknown_length():
             + (2).to_bytes(2, "little") + (16).to_bytes(2, "little") + b"data\xff\xff\xff\xff")
 
 
+class ClosingStream(StreamingResponse):
+    """Closes the generator once the response ends, so a client hanging up reaches it as GeneratorExit
+    (Starlette leaves it paused until garbage collection)."""
+
+    def __init__(self, gen, **kw):
+        super().__init__(gen, **kw)
+        self.gen = gen
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.gen.close()  # safe: anyio lets the running sentence finish before the cancel lands
+
+
 @app.post("/v1/audio/speech")
 def speech(req: SpeechRequest):  # sync def: FastAPI runs it in a threadpool, keeping the event loop free
     tag, started = os.urandom(2).hex(), time.perf_counter()
@@ -132,10 +147,11 @@ def speech(req: SpeechRequest):  # sync def: FastAPI runs it in a threadpool, ke
              f"{req.response_format}" + (" · stream" if req.stream else "")
              + (f" · speed {req.speed:g}x" if req.speed != 1.0 else ""), extra=RICH)
 
-    def done(samples, size):
+    def done(samples, size, first=None):
         took = time.perf_counter() - started
         LOG.info(f"[dim cyan]{tag}[/] [bold magenta]speech[/] [green]done[/] in {took:.2f} s · "
-                 f"{samples / SR:.1f} s audio ({samples / SR / took:.0f}x) · {size / 1024:,.0f} KB", extra=RICH)
+                 + (f"first audio {first:.2f} s · " if first is not None else "")
+                 + f"{samples / SR:.1f} s audio ({samples / SR / took:.0f}x) · {size / 1024:,.0f} KB", extra=RICH)
 
     def reject(message):
         LOG.warning(f"[dim cyan]{tag}[/] [yellow]✗ 400[/] {escape(message)}", extra=RICH)
@@ -150,14 +166,22 @@ def speech(req: SpeechRequest):  # sync def: FastAPI runs it in a threadpool, ke
             raise reject("streaming supports wav and pcm")
         def body():
             samples = size = 0
-            if req.response_format == "wav":
-                yield (head := wav_header_unknown_length())
-                size = len(head)
-            for audio in chunks(pipe, voice, req, SENTENCES):
-                samples, size = samples + len(audio), size + 2 * len(audio)
-                yield pcm16(audio)
-            done(samples, size)
-        return StreamingResponse(body(), media_type=MEDIA[req.response_format])
+            first = None
+            try:
+                if req.response_format == "wav":
+                    yield (head := wav_header_unknown_length())
+                    size = len(head)
+                for audio in chunks(pipe, voice, req, SENTENCES):
+                    if first is None:
+                        first = time.perf_counter() - started
+                    samples, size = samples + len(audio), size + 2 * len(audio)
+                    yield pcm16(audio)
+            except GeneratorExit:  # the client hung up; generation stops here
+                LOG.warning(f"[dim cyan]{tag}[/] [yellow]✗ client left[/] after {time.perf_counter() - started:.2f} s"
+                            f" · {samples / SR:.1f} s audio made", extra=RICH)
+                raise
+            done(samples, size, first)
+        return ClosingStream(body(), media_type=MEDIA[req.response_format])
     parts = list(chunks(pipe, voice, req))
     if not parts:
         raise reject("nothing to speak in input")
