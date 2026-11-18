@@ -1,0 +1,11 @@
+[project]
+name = "nano-edge-server"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.163.1",
+    "kokoro==0.9.4",
+    "safetensors>=0.8.0",
+    "soundfile>=0.14.0",
+    "uvicorn[standard]>=0.54.0",
+]
