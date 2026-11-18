@@ -4,11 +4,12 @@ OpenAI-compatible text-to-speech server for [nano-edge-tts](https://huggingface.
 Kokoro-82M with its decoder swapped for a 1.75M-parameter one (about 85x real time on an M1 with the default 4 workers).
 
 ```sh
-uv run --env-file .env uvicorn server:app
+uv run server.py
 ```
 
-`.env` sets the defaults: `127.0.0.1:8020`, 4 workers, 1 thread each (see [Throughput](#throughput)).
-Command-line flags override it, e.g. `uv run --env-file .env uvicorn server:app --workers 1` while developing.
+Defaults: `127.0.0.1:8020`, 4 workers, 1 thread each (see [Throughput](#throughput)).
+Override with environment variables, e.g. `WORKERS=1 uv run server.py` while developing
+(`HOST`, `PORT`, `WORKERS`, `OMP_NUM_THREADS`).
 
 The first start downloads Kokoro (~330 MB) and the nano-edge weights (7 MB) to the Hugging Face cache.
 
@@ -71,7 +72,7 @@ Blends are computed once and cached, so they cost the same as a single voice.
 
 ## Throughput
 
-One worker synthesises one request at a time, so the default `.env` runs 4 single-threaded workers. Send several
+One worker synthesises one request at a time, so the default is 4 single-threaded workers. Send several
 requests at once (about 2 per worker) to keep them all busy, for example when rendering a whole book.
 
 Measured on an M1 (4 fast + 4 efficiency cores, 16 GB), rendering a mix of long and short audiobook lines with
@@ -82,7 +83,7 @@ twice as many requests in flight as workers:
 | 1 × 4 (torch default) | 43x real time | 1.1 GB |
 | 1 × 1 | 48x | 1.1 GB |
 | 2 × 2 | 52x | |
-| **4 × 1 (`.env` default)** | **82-86x** | 4.0 GB |
+| **4 × 1 (default)** | **82-86x** | 4.0 GB |
 | 6 × 1 | 92x | 4.4 GB |
 | 8 × 1 | 86x | |
 

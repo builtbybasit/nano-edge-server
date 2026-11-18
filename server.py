@@ -1,15 +1,23 @@
 """OpenAI-compatible TTS server for nano-edge-tts (Kokoro-82M with a 1.75M-parameter decoder).
 
-    uv run --env-file .env uvicorn server:app      # settings in .env: port 8020, 4 workers
+    uv run server.py      # 127.0.0.1:8020, 4 workers; override with HOST, PORT, WORKERS
 """
 import io
+import logging
 import os
 import threading
+import time
+import warnings
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Literal
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")  # before torch loads: one thread per worker is fastest (see README)
+
 import numpy as np
+import uvicorn
+from rich.logging import RichHandler
+from rich.markup import escape
 import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException
@@ -24,6 +32,14 @@ MAX_CHARS = 20_000
 MEDIA = {"wav": "audio/wav", "flac": "audio/flac", "pcm": "audio/pcm"}
 
 SENTENCES = r"(?<=[.!?…])\s+|\n+"  # stream sentence by sentence; Kokoro's default splits only on newlines
+
+logging.basicConfig(level="INFO", format="%(message)s", datefmt="[%X]",
+                    handlers=[RichHandler(show_path=False, rich_tracebacks=True)])
+logging.getLogger("httpx2").setLevel("WARNING")  # huggingface_hub logs every HEAD request otherwise
+logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel("ERROR")  # "not supported in MacOs"
+warnings.filterwarnings("ignore", module="torch")  # deprecation chatter from Kokoro's model code
+LOG = logging.getLogger("nano_edge")
+RICH = {"markup": True, "highlighter": None}  # log lines that colour themselves
 
 state = {}
 # ponytail: one model call at a time, taken per chunk (never across a yield) so concurrent streams interleave;
@@ -59,6 +75,8 @@ async def lifespan(app):
     state["pipes"] = {lang: KPipeline(lang_code=lang, model=model, repo_id=KOKORO) for lang in "ab"}
     state["voices"] = sorted(f[7:-3] for f in list_repo_files(KOKORO)
                              if f.startswith("voices/") and f.endswith(".pt") and f[7] in "ab")
+    LOG.info(f"[bold green]Ready[/] · worker {os.getpid()} · {len(state['voices'])} voices · "
+             f"{os.environ['OMP_NUM_THREADS']} thread(s)", extra=RICH)
     yield
 
 
@@ -109,22 +127,40 @@ def wav_header_unknown_length():
 
 @app.post("/v1/audio/speech")
 def speech(req: SpeechRequest):  # sync def: FastAPI runs it in a threadpool, keeping the event loop free
+    tag, started = os.urandom(2).hex(), time.perf_counter()
+    LOG.info(f"[dim cyan]{tag}[/] [bold magenta]speech[/] ← {len(req.input)} chars · voice {escape(req.voice)} · "
+             f"{req.response_format}" + (" · stream" if req.stream else "")
+             + (f" · speed {req.speed:g}x" if req.speed != 1.0 else ""), extra=RICH)
+
+    def done(samples, size):
+        took = time.perf_counter() - started
+        LOG.info(f"[dim cyan]{tag}[/] [bold magenta]speech[/] [green]done[/] in {took:.2f} s · "
+                 f"{samples / SR:.1f} s audio ({samples / SR / took:.0f}x) · {size / 1024:,.0f} KB", extra=RICH)
+
+    def reject(message):
+        LOG.warning(f"[dim cyan]{tag}[/] [yellow]✗ 400[/] {escape(message)}", extra=RICH)
+        return HTTPException(400, message)
+
     try:
         pipe, voice = voice_tensor(req.voice)
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise reject(str(e))
     if req.stream:
         if req.response_format == "flac":
-            raise HTTPException(400, "streaming supports wav and pcm")
+            raise reject("streaming supports wav and pcm")
         def body():
+            samples = size = 0
             if req.response_format == "wav":
-                yield wav_header_unknown_length()
+                yield (head := wav_header_unknown_length())
+                size = len(head)
             for audio in chunks(pipe, voice, req, SENTENCES):
+                samples, size = samples + len(audio), size + 2 * len(audio)
                 yield pcm16(audio)
+            done(samples, size)
         return StreamingResponse(body(), media_type=MEDIA[req.response_format])
     parts = list(chunks(pipe, voice, req))
     if not parts:
-        raise HTTPException(400, "nothing to speak in input")
+        raise reject("nothing to speak in input")
     audio = np.concatenate(parts)
     if req.response_format == "pcm":
         body = pcm16(audio)
@@ -132,6 +168,7 @@ def speech(req: SpeechRequest):  # sync def: FastAPI runs it in a threadpool, ke
         buf = io.BytesIO()
         sf.write(buf, audio, SR, format=req.response_format.upper(), subtype="PCM_16")
         body = buf.getvalue()
+    done(len(audio), len(body))
     return Response(body, media_type=MEDIA[req.response_format])
 
 
@@ -150,3 +187,8 @@ def models():
 def health():
     return {"ok": "pipes" in state}
 
+
+if __name__ == "__main__":
+    # log_config=None: uvicorn's own logs go through the rich handler above instead of its plain formatter
+    uvicorn.run("server:app", host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", 8020)),
+                workers=int(os.environ.get("WORKERS", 4)), log_config=None)
